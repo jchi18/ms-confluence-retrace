@@ -4,49 +4,56 @@ indicator("A+ Confluence Marker", overlay=true, max_lines_count=500, max_labels_
 // ============================================================================
 //  A+ CONFLUENCE MARKER
 //  -------------------------------------------------------------------------
-//  This does ONE thing: it finds institutional A+ confluences and draws them
-//  so you can line up your own OTE.  A+ = a Fair Value Gap AND an Order Block
-//  of the SAME direction whose price ranges OVERLAP.  The overlap region is
-//  the A+ zone - that is where FVG (imbalance) and OB (last institutional
-//  candle) agree on price.  It does NOT mark entries, targets, size or OTE.
-//  You draw your OTE; this tells you whether it lands on real confluence.
-//
-//  It also (optionally) shows the raw FVGs and OBs faintly, colours A+ zones
-//  by HTF bias, and fires an alert the moment price taps a fresh A+ zone.
+//  Finds institutional A+ confluences and draws them so you can line up your
+//  OWN OTE. It tracks three institutional zone types, all same idea - "smart
+//  money left a footprint here":
+//     FVG - Fair Value Gap (3-candle imbalance)
+//     OB  - Order Block (last opposite candle before a displacement break)
+//     RB  - strong Rejection Block (candle with a long rejection wick)
+//  An A+ zone = any TWO different types, same direction, STACKED together
+//  (overlapping or within a small ATR gap). A triple stack (FVG+OB+RB) is the
+//  strongest and is flagged as A++.
+//  It does NOT mark entries, targets, size or OTE - you draw your OTE, this
+//  tells you whether it lands on real stacked confluence, and alerts when
+//  price taps one live.
 // ============================================================================
 
 // ---------------------------------------------------------------------------
 // INPUTS
 // ---------------------------------------------------------------------------
 g1 = "1) Structure"
-pivotLen = input.int(5, "Swing length (for Order Blocks)", minval=2, maxval=50, group=g1, tooltip="How many bars either side define a swing. Bigger = only bigger structure breaks create OBs.")
+pivotLen = input.int(5, "Swing length", minval=2, maxval=50, group=g1, tooltip="Bars either side that define a swing. Drives both Order Blocks and Rejection Blocks.")
 useDisp  = input.bool(true, "Only build OBs on a displacement break", group=g1, tooltip="The breaking candle's range must be >= mult x ATR. Filters weak, choppy breaks.")
 dispMult = input.float(1.2, "Displacement = ATR x", minval=0.2, step=0.1, group=g1)
 atrLen   = input.int(14, "ATR length", minval=1, group=g1)
 
-g2 = "2) A+ zone (FVG + OB overlap)"
-minOverlapATR = input.float(0.0, "Ignore overlaps thinner than ATR x", minval=0.0, step=0.05, group=g2, tooltip="0 = show every overlap. Raise it to hide paper-thin, low-value A+ zones.")
-freshOnly     = input.bool(true, "Only pair fresh (unmitigated) FVGs & OBs", group=g2)
+g2 = "2) Zones + A+ pairing"
+useFVG = input.bool(true, "Include FVGs", group=g2)
+useOB  = input.bool(true, "Include Order Blocks", group=g2)
+useRB  = input.bool(true, "Include strong Rejection Blocks", group=g2)
+rbWick = input.float(2.0, "Strong RB wick : body ratio", minval=0.5, step=0.1, group=g2, tooltip="Higher = only long, decisive rejection wicks qualify. This is the 'strong' filter.")
+pairTolATR = input.float(1.0, "Max gap to stack (ATR x)", minval=0.0, step=0.1, group=g2, tooltip="Two zones pair into an A+ when they overlap OR sit within this many ATRs of each other. Bigger = more (looser) A+ zones.")
 
-g3 = "3) HTF bias (optional filter / colour)"
-useHTF  = input.bool(false, "Only show A+ zones aligned with HTF bias", group=g3, tooltip="Off = show both bullish and bearish A+ zones. On = only the ones agreeing with the higher timeframe trend.")
+g3 = "3) HTF bias (optional filter)"
+useHTF  = input.bool(false, "Only show A+ zones aligned with HTF bias", group=g3)
 htfTF   = input.timeframe("15", "HTF timeframe", group=g3)
 htfPiv  = input.int(5, "HTF swing length", minval=2, maxval=50, group=g3)
 
 g4 = "4) Display"
-showAplus = input.bool(true,  "Draw A+ overlap zones", group=g4)
-showRaw   = input.bool(false, "Also draw raw FVG / OB (faint)", group=g4)
+showAplus = input.bool(true,  "Draw A+ stacked zones", group=g4)
+showRaw   = input.bool(true,  "Also draw raw FVG / OB / RB (faint)", group=g4)
 showStruct= input.bool(false, "Show BOS / CHoCH labels", group=g4)
 extendBars= input.int(30, "Extend zones (bars to the right)", minval=5, maxval=200, group=g4)
 showTable = input.bool(true, "Show status table", group=g4)
 
 // colours
-cBullA = color.new(color.teal,   35)
-cBearA = color.new(color.red,    35)
-cBullAf= color.new(color.teal,   82)   // faint fill
-cBearAf= color.new(color.red,    82)
-cFVG   = color.new(color.blue,   88)
-cOB    = color.new(color.purple, 88)
+cBullAf= color.new(color.teal,   80)   // A+ fill
+cBearAf= color.new(color.red,    80)
+cBullA = color.new(color.teal,   25)   // A+ border
+cBearA = color.new(color.red,    25)
+cFVG   = color.new(color.blue,   90)   // faint raw fills
+cOB    = color.new(color.purple, 90)
+cRB    = color.new(color.orange, 90)
 bull   = color.new(color.teal, 0)
 bear   = color.new(color.red, 0)
 
@@ -71,63 +78,93 @@ f_htfTrend() =>
         t := -1
     t
 htfTrend = request.security(syminfo.tickerid, htfTF, f_htfTrend(), lookahead=barmerge.lookahead_off)
+f_biasOK(_dir) => not useHTF or (_dir == 1 ? htfTrend == 1 : htfTrend == -1)
 
 // ---------------------------------------------------------------------------
-// STORES
-//   FVGs and OBs are kept as parallel arrays so we can test overlaps.
-//   Each: top, bot, dir(1 bull / 0 bear), bar(created), mit(0/1 mitigated).
+// UNIFIED ZONE STORE  (FVG / OB / RB, all in one set of arrays)
+//   type: 1 = FVG, 2 = OB, 3 = RB   |   dir: 1 = bull, 0 = bear
 // ---------------------------------------------------------------------------
-var float[] fvTop = array.new_float()
-var float[] fvBot = array.new_float()
-var int[]   fvDir = array.new_int()
-var int[]   fvBar = array.new_int()
+var float[] zTop  = array.new_float()
+var float[] zBot  = array.new_float()
+var int[]   zDir  = array.new_int()
+var int[]   zType = array.new_int()
 
-var float[] obTop = array.new_float()
-var float[] obBot = array.new_float()
-var int[]   obDir = array.new_int()
-var int[]   obBar = array.new_int()
-
-// active A+ zones
+// active A+ zones (drawn boxes we manage over time)
 var float[] azTop = array.new_float()
 var float[] azBot = array.new_float()
 var int[]   azDir = array.new_int()
 var box[]   azBox = array.new_box()
-var int[]   azTap = array.new_int()   // 1 once we've alerted its first tap
+var int[]   azTap = array.new_int()
+
+f_typeName(_t) => _t == 1 ? "FVG" : _t == 2 ? "OB" : "RB"
+
+// draw one A+ box for a stacked pair (or upgrade text when 3 types stack)
+f_pair(_dir, _aTop, _aBot, _bTop, _bBot, _triple) =>
+    zt = math.max(_aTop, _bTop)
+    zb = math.min(_aBot, _bBot)
+    array.push(azTop, zt)
+    array.push(azBot, zb)
+    array.push(azDir, _dir)
+    array.push(azTap, 0)
+    col  = _dir == 1 ? cBullAf : cBearAf
+    bcol = _dir == 1 ? cBullA  : cBearA
+    txt  = _triple ? "A++" : "A+"
+    b = box.new(bar_index, zt, bar_index + extendBars, zb, border_color=bcol, border_width=2, bgcolor=col, text=txt, text_size=size.small, text_color=_dir==1?bull:bear, text_halign=text.align_left, text_valign=text.align_center)
+    array.push(azBox, b)
+
+// add a new institutional zone: draw it faint, pair it with the nearest
+// different-type same-direction zone already on the chart, then store it.
+f_addZone(_top, _bot, _dir, _type) =>
+    if showRaw and _top > _bot
+        bg = _type == 1 ? cFVG : _type == 2 ? cOB : cRB
+        bd = _type == 1 ? color.new(color.blue,55) : _type == 2 ? color.new(color.purple,55) : color.new(color.orange,55)
+        box.new(bar_index, _top, bar_index + 6, _bot, border_color=bd, bgcolor=bg, text=f_typeName(_type), text_size=size.tiny, text_color=bd)
+    if showAplus and _top > _bot and f_biasOK(_dir) and array.size(zTop) > 0
+        bestGap = 1.0e12
+        float bTop = na
+        float bBot = na
+        types = 0
+        for j = 0 to array.size(zTop) - 1
+            if array.get(zDir, j) == _dir and array.get(zType, j) != _type
+                oT = array.get(zTop, j)
+                oB = array.get(zBot, j)
+                gap = math.max(_bot, oB) - math.min(_top, oT)   // <=0 = overlap
+                if gap <= pairTolATR * atr
+                    types := types | array.get(zType, j)
+                    if gap < bestGap
+                        bestGap := gap
+                        bTop := oT
+                        bBot := oB
+        if not na(bTop)
+            triple = (types | _type) == 7   // all three type bits present nearby
+            f_pair(_dir, _top, _bot, bTop, bBot, triple)
+    if _top > _bot
+        array.push(zTop, _top)
+        array.push(zBot, _bot)
+        array.push(zDir, _dir)
+        array.push(zType, _type)
+
+// mitigate stored zones price has closed fully through (+ hard size cap)
+if array.size(zTop) > 0
+    for i = array.size(zTop) - 1 to 0
+        d = array.get(zDir, i)
+        gone = d == 1 ? (close < array.get(zBot, i)) : (close > array.get(zTop, i))
+        if gone or array.size(zTop) > 120
+            array.remove(zTop, i)
+            array.remove(zBot, i)
+            array.remove(zDir, i)
+            array.remove(zType, i)
 
 // ---------------------------------------------------------------------------
 // 1) FVG DETECTION  (3-candle imbalance)
 // ---------------------------------------------------------------------------
-newFVG = false
-if low > high[2]
-    array.push(fvTop, low)
-    array.push(fvBot, high[2])
-    array.push(fvDir, 1)
-    array.push(fvBar, bar_index - 1)
-    newFVG := true
-    if showRaw
-        box.new(bar_index-2, low, bar_index-1, high[2], border_color=na, bgcolor=cFVG)
-if high < low[2]
-    array.push(fvTop, low[2])
-    array.push(fvBot, high)
-    array.push(fvDir, 0)
-    array.push(fvBar, bar_index - 1)
-    newFVG := true
-    if showRaw
-        box.new(bar_index-2, low[2], bar_index-1, high, border_color=na, bgcolor=cFVG)
-
-// mitigate filled FVGs (bull filled when price trades back below its bottom)
-if array.size(fvTop) > 0
-    for i = array.size(fvTop) - 1 to 0
-        d = array.get(fvDir, i)
-        filled = d == 1 ? (low < array.get(fvBot, i)) : (high > array.get(fvTop, i))
-        if filled or array.size(fvTop) > 60
-            array.remove(fvTop, i)
-            array.remove(fvBot, i)
-            array.remove(fvDir, i)
-            array.remove(fvBar, i)
+if useFVG and low > high[2]
+    f_addZone(low, high[2], 1, 1)
+if useFVG and high < low[2]
+    f_addZone(low[2], high, 0, 1)
 
 // ---------------------------------------------------------------------------
-// 2) STRUCTURE + ORDER BLOCK DETECTION
+// 2) STRUCTURE + ORDER BLOCKS
 // ---------------------------------------------------------------------------
 ph = ta.pivothigh(high, pivotLen, pivotLen)
 pl = ta.pivotlow(low,  pivotLen, pivotLen)
@@ -143,23 +180,16 @@ if not na(pl)
 dispOK = (high - low) >= dispMult * atr
 bullBreak = not na(lastPH) and close > lastPH and lastPH != lastBrokeH
 bearBreak = not na(lastPL) and close < lastPL and lastPL != lastBrokeL
-
-newOB = false
 if bullBreak
     lastBrokeH := lastPH
     if not useDisp or dispOK
         wasBear = trend == -1
         trend := 1
-        for i = 1 to 30
-            if close[i] < open[i]
-                array.push(obTop, high[i])
-                array.push(obBot, low[i])
-                array.push(obDir, 1)
-                array.push(obBar, bar_index - i)
-                newOB := true
-                if showRaw
-                    box.new(bar_index-i, high[i], bar_index-i+1, low[i], border_color=color.new(color.purple,60), bgcolor=cOB)
-                break
+        if useOB
+            for i = 1 to 30
+                if close[i] < open[i]
+                    f_addZone(high[i], low[i], 1, 2)
+                    break
         if showStruct
             label.new(bar_index, high, wasBear ? "CHoCH" : "BOS", style=label.style_label_down, color=bull, textcolor=color.white, size=size.small)
 if bearBreak
@@ -167,100 +197,50 @@ if bearBreak
     if not useDisp or dispOK
         wasBull = trend == 1
         trend := -1
-        for i = 1 to 30
-            if close[i] > open[i]
-                array.push(obTop, high[i])
-                array.push(obBot, low[i])
-                array.push(obDir, 0)
-                array.push(obBar, bar_index - i)
-                newOB := true
-                if showRaw
-                    box.new(bar_index-i, high[i], bar_index-i+1, low[i], border_color=color.new(color.purple,60), bgcolor=cOB)
-                break
+        if useOB
+            for i = 1 to 30
+                if close[i] > open[i]
+                    f_addZone(high[i], low[i], 0, 2)
+                    break
         if showStruct
             label.new(bar_index, low, wasBull ? "CHoCH" : "BOS", style=label.style_label_up, color=bear, textcolor=color.white, size=size.small)
 
-// mitigate OBs that price has closed fully through
-if array.size(obTop) > 0
-    for i = array.size(obTop) - 1 to 0
-        d = array.get(obDir, i)
-        gone = d == 1 ? (close < array.get(obBot, i)) : (close > array.get(obTop, i))
-        if gone or array.size(obTop) > 60
-            array.remove(obTop, i)
-            array.remove(obBot, i)
-            array.remove(obDir, i)
-            array.remove(obBar, i)
-
 // ---------------------------------------------------------------------------
-// 3) A+ PAIRING  (a fresh FVG + OB, same direction, ranges overlap)
-//    Checked whenever a new FVG or a new OB appears, so each pair draws once.
+// 3) STRONG REJECTION BLOCKS  (long-wick candle at a confirmed pivot)
 // ---------------------------------------------------------------------------
-f_biasOK(_dir) => not useHTF or (_dir == 1 ? htfTrend == 1 : htfTrend == -1)
-
-f_makeAplus(_dir, _top, _bot) =>
-    if _top > _bot and (_top - _bot) >= minOverlapATR * atr and f_biasOK(_dir)
-        array.push(azTop, _top)
-        array.push(azBot, _bot)
-        array.push(azDir, _dir)
-        array.push(azTap, 0)
-        col  = _dir == 1 ? cBullAf : cBearAf
-        bcol = _dir == 1 ? cBullA  : cBearA
-        b = box.new(bar_index, _top, bar_index + extendBars, _bot, border_color=bcol, border_width=1, bgcolor=col, text="A+", text_size=size.tiny, text_color=_dir==1?bull:bear, text_halign=text.align_left, text_valign=text.align_center)
-        array.push(azBox, b)
-
-// new FVG vs every existing OB
-if newFVG and array.size(obTop) > 0
-    fi = array.size(fvTop) - 1
-    fd = array.get(fvDir, fi)
-    ft = array.get(fvTop, fi)
-    fb = array.get(fvBot, fi)
-    for j = 0 to array.size(obTop) - 1
-        if array.get(obDir, j) == fd
-            ot = array.get(obTop, j)
-            ob = array.get(obBot, j)
-            top = math.min(ft, ot)
-            bot = math.max(fb, ob)
-            f_makeAplus(fd, top, bot)
-
-// new OB vs every existing FVG
-if newOB and array.size(fvTop) > 0
-    oi = array.size(obTop) - 1
-    od = array.get(obDir, oi)
-    ot = array.get(obTop, oi)
-    ob = array.get(obBot, oi)
-    for j = 0 to array.size(fvTop) - 1
-        if array.get(fvDir, j) == od
-            ft = array.get(fvTop, j)
-            fb = array.get(fvBot, j)
-            top = math.min(ft, ot)
-            bot = math.max(fb, ob)
-            f_makeAplus(od, top, bot)
+if useRB and not na(pl)
+    lw = math.min(open[pivotLen], close[pivotLen]) - low[pivotLen]
+    bd = math.abs(close[pivotLen] - open[pivotLen])
+    if lw > bd * rbWick and lw > 0
+        f_addZone(math.min(open[pivotLen], close[pivotLen]), low[pivotLen], 1, 3)
+if useRB and not na(ph)
+    uw = high[pivotLen] - math.max(open[pivotLen], close[pivotLen])
+    bd = math.abs(close[pivotLen] - open[pivotLen])
+    if uw > bd * rbWick and uw > 0
+        f_addZone(high[pivotLen], math.max(open[pivotLen], close[pivotLen]), 0, 3)
 
 // ---------------------------------------------------------------------------
 // 4) MANAGE ACTIVE A+ ZONES: extend, detect live tap, mitigate
 // ---------------------------------------------------------------------------
 tapBull = false
-tapShort = false
-if showAplus and array.size(azTop) > 0
+tapBear = false
+if array.size(azTop) > 0
     for i = array.size(azTop) - 1 to 0
         zt = array.get(azTop, i)
         zb = array.get(azBot, i)
         zd = array.get(azDir, i)
         bx = array.get(azBox, i)
         box.set_right(bx, bar_index + extendBars)
-        // price wick intersects the zone?
-        inZone = low <= zt and high >= zb
-        if inZone and array.get(azTap, i) == 0
+        if low <= zt and high >= zb and array.get(azTap, i) == 0
             array.set(azTap, i, 1)
             if zd == 1
                 tapBull := true
             else
-                tapShort := true
-        // mitigate: closed fully through the zone
+                tapBear := true
         gone = zd == 1 ? (close < zb) : (close > zt)
         if gone
-            box.set_bgcolor(bx, color.new(color.gray, 90))
-            box.set_border_color(bx, color.new(color.gray, 70))
+            box.set_bgcolor(bx, color.new(color.gray, 92))
+            box.set_border_color(bx, color.new(color.gray, 75))
             box.set_right(bx, bar_index)
             array.remove(azTop, i)
             array.remove(azBot, i)
@@ -268,7 +248,6 @@ if showAplus and array.size(azTop) > 0
             array.remove(azBox, i)
             array.remove(azTap, i)
 
-// count what's live
 liveBull = 0
 liveBear = 0
 if array.size(azDir) > 0
@@ -281,16 +260,14 @@ if array.size(azDir) > 0
 // ---------------------------------------------------------------------------
 // 5) TAP MARKERS + ALERTS
 // ---------------------------------------------------------------------------
-plotshape(tapBull,  title="Bull A+ tap", style=shape.triangleup,   location=location.belowbar, color=bull, size=size.tiny, text="A+")
-plotshape(tapShort, title="Bear A+ tap", style=shape.triangledown, location=location.abovebar, color=bear, size=size.tiny, text="A+")
-
+plotshape(tapBull, title="Bull A+ tap", style=shape.triangleup,   location=location.belowbar, color=bull, size=size.tiny, text="A+")
+plotshape(tapBear, title="Bear A+ tap", style=shape.triangledown, location=location.abovebar, color=bear, size=size.tiny, text="A+")
 if tapBull
     alert("Bullish A+ confluence tapped on " + syminfo.ticker + " @ " + str.tostring(close) + " - check your OTE", alert.freq_once_per_bar_close)
-if tapShort
+if tapBear
     alert("Bearish A+ confluence tapped on " + syminfo.ticker + " @ " + str.tostring(close) + " - check your OTE", alert.freq_once_per_bar_close)
-
-alertcondition(tapBull,  "Bull A+ tap", "Bullish A+ (FVG+OB) tapped on {{ticker}} @ {{close}}")
-alertcondition(tapShort, "Bear A+ tap", "Bearish A+ (FVG+OB) tapped on {{ticker}} @ {{close}}")
+alertcondition(tapBull, "Bull A+ tap", "Bullish A+ tapped on {{ticker}} @ {{close}}")
+alertcondition(tapBear, "Bear A+ tap", "Bearish A+ tapped on {{ticker}} @ {{close}}")
 
 // ---------------------------------------------------------------------------
 // 6) STATUS TABLE
