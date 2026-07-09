@@ -32,7 +32,9 @@ useFVG = input.bool(true, "Include FVGs", group=g2)
 useOB  = input.bool(true, "Include Order Blocks", group=g2)
 useRB  = input.bool(true, "Include strong Rejection Blocks", group=g2)
 rbWick = input.float(2.0, "Strong RB wick : body ratio", minval=0.5, step=0.1, group=g2, tooltip="Higher = only long, decisive rejection wicks qualify. This is the 'strong' filter.")
-pairTolATR = input.float(1.0, "Max gap to stack (ATR x)", minval=0.0, step=0.1, group=g2, tooltip="Two zones pair into an A+ when they overlap OR sit within this many ATRs of each other. Bigger = more (looser) A+ zones.")
+pairTolATR = input.float(0.5, "Max gap to stack (ATR x)", minval=0.0, step=0.1, group=g2, tooltip="Two zones pair into an A+ when they overlap OR sit within this many ATRs of each other. Bigger = more (looser) A+ zones. Keep it small for only tight, strong stacks.")
+minTypes = input.int(2, "Strength: min stacked types", minval=2, maxval=3, group=g2, tooltip="2 = show A+ (any two of FVG/OB/RB). 3 = show ONLY A++ triple stacks - fewest, strongest.")
+maxLive  = input.int(6, "Max A+ zones on screen", minval=1, maxval=30, group=g2, tooltip="Only the most recent N live A+ zones are kept. Lower = less clutter.")
 
 g3 = "3) HTF bias (optional filter)"
 useHTF  = input.bool(false, "Only show A+ zones aligned with HTF bias", group=g3)
@@ -41,7 +43,7 @@ htfPiv  = input.int(5, "HTF swing length", minval=2, maxval=50, group=g3)
 
 g4 = "4) Display"
 showAplus = input.bool(true,  "Draw A+ stacked zones", group=g4)
-showRaw   = input.bool(true,  "Also draw raw FVG / OB / RB (faint)", group=g4)
+showRaw   = input.bool(false, "Also draw raw FVG / OB / RB (faint)", group=g4)
 showStruct= input.bool(false, "Show BOS / CHoCH labels", group=g4)
 extendBars= input.int(30, "Extend zones (bars to the right)", minval=5, maxval=200, group=g4)
 showTable = input.bool(true, "Show status table", group=g4)
@@ -102,15 +104,30 @@ f_typeName(_t) => _t == 1 ? "FVG" : _t == 2 ? "OB" : "RB"
 f_pair(_dir, _aTop, _aBot, _bTop, _bBot, _triple) =>
     zt = math.max(_aTop, _bTop)
     zb = math.min(_aBot, _bBot)
-    array.push(azTop, zt)
-    array.push(azBot, zb)
-    array.push(azDir, _dir)
-    array.push(azTap, 0)
-    col  = _dir == 1 ? cBullAf : cBearAf
-    bcol = _dir == 1 ? cBullA  : cBearA
-    txt  = _triple ? "A++" : "A+"
-    b = box.new(bar_index, zt, bar_index + extendBars, zb, border_color=bcol, border_width=2, bgcolor=col, text=txt, text_size=size.small, text_color=_dir==1?bull:bear, text_halign=text.align_left, text_valign=text.align_center)
-    array.push(azBox, b)
+    // de-dupe: skip if a live A+ of the same direction already covers this region
+    dup = false
+    if array.size(azTop) > 0
+        for k = 0 to array.size(azTop) - 1
+            if array.get(azDir, k) == _dir and math.min(zt, array.get(azTop, k)) >= math.max(zb, array.get(azBot, k))
+                dup := true
+    if not dup
+        array.push(azTop, zt)
+        array.push(azBot, zb)
+        array.push(azDir, _dir)
+        array.push(azTap, 0)
+        col  = _dir == 1 ? cBullAf : cBearAf
+        bcol = _dir == 1 ? cBullA  : cBearA
+        txt  = _triple ? "A++" : "A+"
+        b = box.new(bar_index, zt, bar_index + extendBars, zb, border_color=bcol, border_width=2, bgcolor=col, text=txt, text_size=size.small, text_color=_dir==1?bull:bear, text_halign=text.align_left, text_valign=text.align_center)
+        array.push(azBox, b)
+        // cap: keep only the most recent N live A+ zones
+        if array.size(azTop) > maxLive
+            box.delete(array.get(azBox, 0))
+            array.remove(azTop, 0)
+            array.remove(azBot, 0)
+            array.remove(azDir, 0)
+            array.remove(azBox, 0)
+            array.remove(azTap, 0)
 
 // add a new institutional zone: draw it faint, pair it with the nearest
 // different-type same-direction zone already on the chart, then store it.
@@ -140,7 +157,8 @@ f_addZone(_top, _bot, _dir, _type) =>
                         bestGap := gap
                         bTop := oT
                         bBot := oB
-        if not na(bTop)
+        nTypes = (sFVG ? 1 : 0) + (sOB ? 1 : 0) + (sRB ? 1 : 0)
+        if not na(bTop) and nTypes >= minTypes
             triple = sFVG and sOB and sRB   // all three types stacked nearby
             f_pair(_dir, _top, _bot, bTop, bBot, triple)
     if _top > _bot
