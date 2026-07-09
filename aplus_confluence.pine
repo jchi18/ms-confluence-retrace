@@ -123,20 +123,25 @@ f_addZone(_top, _bot, _dir, _type) =>
         bestGap = 1.0e12
         float bTop = na
         float bBot = na
-        types = 0
+        bool sFVG = _type == 1
+        bool sOB  = _type == 2
+        bool sRB  = _type == 3
         for j = 0 to array.size(zTop) - 1
             if array.get(zDir, j) == _dir and array.get(zType, j) != _type
                 oT = array.get(zTop, j)
                 oB = array.get(zBot, j)
                 gap = math.max(_bot, oB) - math.min(_top, oT)   // <=0 = overlap
                 if gap <= pairTolATR * atr
-                    types := types | array.get(zType, j)
+                    pt = array.get(zType, j)
+                    sFVG := sFVG or pt == 1
+                    sOB  := sOB  or pt == 2
+                    sRB  := sRB  or pt == 3
                     if gap < bestGap
                         bestGap := gap
                         bTop := oT
                         bBot := oB
         if not na(bTop)
-            triple = (types | _type) == 7   // all three type bits present nearby
+            triple = sFVG and sOB and sRB   // all three types stacked nearby
             f_pair(_dir, _top, _bot, bTop, bBot, triple)
     if _top > _bot
         array.push(zTop, _top)
