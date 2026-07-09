@@ -9,8 +9,8 @@ indicator("A+ Confluence Marker", overlay=true, max_lines_count=500, max_labels_
 //     FVG   - a SIGNIFICANT Fair Value Gap (size + optional displacement)
 //     OB    - an Order Block from a DISPLACEMENT break (not chop)
 //     RB    - a STRONG Rejection Block (long rejection wick)
-//     SWEEP - a liquidity sweep: took out a recent swing high/low and reclaimed
 //  Nothing is required to "stack" - each is a valid A+ POI on its own.
+//  Every zone is anchored to the EXACT candle that formed it for precision.
 //  Relevance filters keep the screen clean: only zones on the retrace side of
 //  price, de-duped, capped. It does NOT mark entries/targets/OTE - you draw
 //  your OTE; this shows the A+ POIs and alerts when price taps one.
@@ -31,8 +31,6 @@ fvgDisp  = input.bool(true, "  FVG needs a displacement candle", group=g2)
 useOB    = input.bool(true, "Order Block (displacement break)", group=g2)
 useRB    = input.bool(true, "Rejection Block (strong wick)", group=g2)
 rbWick   = input.float(2.0, "  strong RB wick : body ratio", minval=0.5, step=0.1, group=g2)
-useSweep = input.bool(true, "Liquidity sweep + reclaim", group=g2)
-sweepLook= input.int(10, "  sweep lookback (bars)", minval=2, maxval=100, group=g2)
 
 g3 = "3) Relevance / declutter"
 sideFilter = input.bool(true, "Only zones on the retrace side of price", group=g3, tooltip="Bullish POIs only below price (discount), bearish only above (premium). Main de-clutter filter.")
@@ -81,10 +79,11 @@ var box[]    azBox  = array.new_box()
 var int[]    azTap  = array.new_int()
 var string[] azKind = array.new_string()
 
-f_kindCol(_kind) => _kind == "FVG" ? color.blue : _kind == "OB" ? color.purple : _kind == "RB" ? color.orange : color.fuchsia
+f_kindCol(_kind) => _kind == "FVG" ? color.blue : _kind == "OB" ? color.purple : color.orange
 
-// add an A+ POI: apply relevance + de-dupe, then draw and cap
-f_addPOI(_top, _bot, _dir, _kind) =>
+// add an A+ POI: apply relevance + de-dupe, then draw and cap.
+// _left = the exact bar the zone was formed on (precise anchor).
+f_addPOI(_left, _top, _bot, _dir, _kind) =>
     ok = _top > _bot
     if ok and sideFilter
         ok := _dir == 1 ? _bot <= close : _top >= close
@@ -96,7 +95,7 @@ f_addPOI(_top, _bot, _dir, _kind) =>
                 ok := false
     if ok
         base = f_kindCol(_kind)
-        b = box.new(bar_index, _top, bar_index + extendBars, _bot, border_color=color.new(base, 20), border_width=2, bgcolor=color.new(base, 80), text=_kind, text_size=size.small, text_color=color.new(base, 0), text_halign=text.align_left, text_valign=text.align_center)
+        b = box.new(_left, _top, bar_index + extendBars, _bot, border_color=color.new(base, 20), border_width=2, bgcolor=color.new(base, 80), text=_kind, text_size=size.small, text_color=color.new(base, 0), text_halign=text.align_left, text_valign=text.align_center)
         array.push(azTop, _top)
         array.push(azBot, _bot)
         array.push(azDir, _dir)
@@ -119,12 +118,12 @@ if useFVG and low > high[2]
     gap = low - high[2]
     dispOKc = (high[1] - low[1]) >= dispMult * atr
     if gap >= fvgMinATR * atr and (not fvgDisp or dispOKc)
-        f_addPOI(low, high[2], 1, "FVG")
+        f_addPOI(bar_index - 2, low, high[2], 1, "FVG")
 if useFVG and high < low[2]
     gap = low[2] - high
     dispOKc = (high[1] - low[1]) >= dispMult * atr
     if gap >= fvgMinATR * atr and (not fvgDisp or dispOKc)
-        f_addPOI(low[2], high, 0, "FVG")
+        f_addPOI(bar_index - 2, low[2], high, 0, "FVG")
 
 // ---------------------------------------------------------------------------
 // 2) STRUCTURE + DISPLACEMENT ORDER BLOCKS
@@ -151,7 +150,7 @@ if bullBreak
         if useOB
             for i = 1 to 30
                 if close[i] < open[i]
-                    f_addPOI(high[i], low[i], 1, "OB")
+                    f_addPOI(bar_index - i, high[i], low[i], 1, "OB")
                     break
         if showStruct
             label.new(bar_index, high, wasBear ? "CHoCH" : "BOS", style=label.style_label_down, color=bull, textcolor=color.white, size=size.small)
@@ -163,7 +162,7 @@ if bearBreak
         if useOB
             for i = 1 to 30
                 if close[i] > open[i]
-                    f_addPOI(high[i], low[i], 0, "OB")
+                    f_addPOI(bar_index - i, high[i], low[i], 0, "OB")
                     break
         if showStruct
             label.new(bar_index, low, wasBull ? "CHoCH" : "BOS", style=label.style_label_up, color=bear, textcolor=color.white, size=size.small)
@@ -175,25 +174,15 @@ if useRB and not na(pl)
     lw = math.min(open[pivotLen], close[pivotLen]) - low[pivotLen]
     bd = math.abs(close[pivotLen] - open[pivotLen])
     if lw > bd * rbWick and lw > 0
-        f_addPOI(math.min(open[pivotLen], close[pivotLen]), low[pivotLen], 1, "RB")
+        f_addPOI(bar_index - pivotLen, math.min(open[pivotLen], close[pivotLen]), low[pivotLen], 1, "RB")
 if useRB and not na(ph)
     uw = high[pivotLen] - math.max(open[pivotLen], close[pivotLen])
     bd = math.abs(close[pivotLen] - open[pivotLen])
     if uw > bd * rbWick and uw > 0
-        f_addPOI(high[pivotLen], math.max(open[pivotLen], close[pivotLen]), 0, "RB")
+        f_addPOI(bar_index - pivotLen, high[pivotLen], math.max(open[pivotLen], close[pivotLen]), 0, "RB")
 
 // ---------------------------------------------------------------------------
-// 4) LIQUIDITY SWEEP + RECLAIM
-// ---------------------------------------------------------------------------
-lowP  = ta.lowest(low,  sweepLook)[1]
-highP = ta.highest(high, sweepLook)[1]
-if useSweep and not na(lowP) and low < lowP and close > lowP
-    f_addPOI(lowP, low, 1, "SWP")
-if useSweep and not na(highP) and high > highP and close < highP
-    f_addPOI(high, highP, 0, "SWP")
-
-// ---------------------------------------------------------------------------
-// 5) MANAGE POIs: extend, detect live tap, mitigate
+// 4) MANAGE POIs: extend, detect live tap, mitigate
 // ---------------------------------------------------------------------------
 tapBull = false
 tapBear = false
@@ -232,7 +221,7 @@ if array.size(azDir) > 0
             liveBear := liveBear + 1
 
 // ---------------------------------------------------------------------------
-// 6) TAP MARKERS + ALERTS
+// 5) TAP MARKERS + ALERTS
 // ---------------------------------------------------------------------------
 plotshape(tapBull, title="Bull POI tap", style=shape.triangleup,   location=location.belowbar, color=bull, size=size.tiny)
 plotshape(tapBear, title="Bear POI tap", style=shape.triangledown, location=location.abovebar, color=bear, size=size.tiny)
@@ -244,7 +233,7 @@ alertcondition(tapBull, "Bull POI tap", "Bullish A+ POI tapped on {{ticker}} @ {
 alertcondition(tapBear, "Bear POI tap", "Bearish A+ POI tapped on {{ticker}} @ {{close}}")
 
 // ---------------------------------------------------------------------------
-// 7) STATUS TABLE
+// 6) STATUS TABLE
 // ---------------------------------------------------------------------------
 if showTable and barstate.islast
     var table tb = table.new(position.top_right, 2, 3, border_width=1)
