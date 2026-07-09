@@ -44,6 +44,14 @@ showStruct= input.bool(false, "Show BOS / CHoCH labels", group=g4)
 extendBars= input.int(30, "Extend zones (bars to the right)", minval=5, maxval=200, group=g4)
 showTable = input.bool(true, "Show status table", group=g4)
 
+g5 = "5) Signals & liquidity"
+showSignals  = input.bool(true, "Fire BUY / SELL signals", group=g5, tooltip="A signal = price taps an A+ POI in the direction of bias + structure, with liquidity to target.")
+reqBias      = input.bool(true, "Require HTF bias alignment", group=g5)
+reqStructure = input.bool(true, "Require LTF structure alignment", group=g5, tooltip="Only long while structure is bullish (last break was a bullish BOS), only short while bearish.")
+reqLiq       = input.bool(true, "Require a liquidity draw to target", group=g5, tooltip="Only signal if there is unswept liquidity (a swing high for longs / low for shorts) for price to run to.")
+showLiq      = input.bool(true, "Draw nearest liquidity (BSL / SSL)", group=g5)
+liqLook      = input.int(60, "Liquidity search depth (bars)", minval=10, maxval=500, group=g5, tooltip="How far back to keep unswept swing highs/lows as liquidity draws.")
+
 bull = color.new(color.teal, 0)
 bear = color.new(color.red, 0)
 atr  = ta.atr(atrLen)
@@ -186,6 +194,8 @@ if useRB and not na(ph)
 // ---------------------------------------------------------------------------
 tapBull = false
 tapBear = false
+float tapBullStop = na
+float tapBearStop = na
 if array.size(azTop) > 0
     for i = array.size(azTop) - 1 to 0
         zt = array.get(azTop, i)
@@ -197,8 +207,10 @@ if array.size(azTop) > 0
             array.set(azTap, i, 1)
             if zd == 1
                 tapBull := true
+                tapBullStop := zb
             else
                 tapBear := true
+                tapBearStop := zt
         gone = zd == 1 ? (close < zb) : (close > zt)
         if gone
             box.set_bgcolor(bx, color.new(color.gray, 92))
@@ -221,26 +233,131 @@ if array.size(azDir) > 0
             liveBear := liveBear + 1
 
 // ---------------------------------------------------------------------------
-// 5) TAP MARKERS + ALERTS
+// 5) DRAWS ON LIQUIDITY (unswept swing highs = BSL, swing lows = SSL)
 // ---------------------------------------------------------------------------
-plotshape(tapBull, title="Bull POI tap", style=shape.triangleup,   location=location.belowbar, color=bull, size=size.tiny)
-plotshape(tapBear, title="Bear POI tap", style=shape.triangledown, location=location.abovebar, color=bear, size=size.tiny)
-if tapBull
-    alert("Price tapped a bullish A+ POI on " + syminfo.ticker + " @ " + str.tostring(close) + " - check your OTE", alert.freq_once_per_bar_close)
-if tapBear
-    alert("Price tapped a bearish A+ POI on " + syminfo.ticker + " @ " + str.tostring(close) + " - check your OTE", alert.freq_once_per_bar_close)
-alertcondition(tapBull, "Bull POI tap", "Bullish A+ POI tapped on {{ticker}} @ {{close}}")
-alertcondition(tapBear, "Bear POI tap", "Bearish A+ POI tapped on {{ticker}} @ {{close}}")
+var float[] hiLvl = array.new_float()
+var int[]   hiBar = array.new_int()
+var float[] loLvl = array.new_float()
+var int[]   loBar = array.new_int()
+
+// store confirmed swing points as resting liquidity
+if not na(ph)
+    array.push(hiLvl, ph)
+    array.push(hiBar, bar_index - pivotLen)
+if not na(pl)
+    array.push(loLvl, pl)
+    array.push(loBar, bar_index - pivotLen)
+
+// drop liquidity that has been swept (traded through) or aged out
+if array.size(hiLvl) > 0
+    for i = array.size(hiLvl) - 1 to 0
+        if high > array.get(hiLvl, i) or (bar_index - array.get(hiBar, i)) > liqLook
+            array.remove(hiLvl, i)
+            array.remove(hiBar, i)
+if array.size(loLvl) > 0
+    for i = array.size(loLvl) - 1 to 0
+        if low < array.get(loLvl, i) or (bar_index - array.get(loBar, i)) > liqLook
+            array.remove(loLvl, i)
+            array.remove(loBar, i)
+
+// nearest unswept draw above (BSL) and below (SSL)
+float tgtBSL = na
+int   barBSL = na
+if array.size(hiLvl) > 0
+    for i = 0 to array.size(hiLvl) - 1
+        lv = array.get(hiLvl, i)
+        if lv > close and (na(tgtBSL) or lv < tgtBSL)
+            tgtBSL := lv
+            barBSL := array.get(hiBar, i)
+float tgtSSL = na
+int   barSSL = na
+if array.size(loLvl) > 0
+    for i = 0 to array.size(loLvl) - 1
+        lv = array.get(loLvl, i)
+        if lv < close and (na(tgtSSL) or lv > tgtSSL)
+            tgtSSL := lv
+            barSSL := array.get(loBar, i)
+
+// draw the two nearest draws as rays (one line each, updated in place)
+var line bslLine = na
+var line sslLine = na
+var label bslLab = na
+var label sslLab = na
+if showLiq and not na(tgtBSL)
+    if na(bslLine)
+        bslLine := line.new(barBSL, tgtBSL, bar_index + extendBars, tgtBSL, color=color.new(color.green, 0), style=line.style_dashed, width=1)
+        bslLab  := label.new(bar_index + extendBars, tgtBSL, "BSL", style=label.style_none, textcolor=color.new(color.green,0), size=size.small)
+    else
+        line.set_xy1(bslLine, barBSL, tgtBSL)
+        line.set_xy2(bslLine, bar_index + extendBars, tgtBSL)
+        label.set_xy(bslLab, bar_index + extendBars, tgtBSL)
+else
+    if not na(bslLine)
+        line.delete(bslLine)
+        label.delete(bslLab)
+        bslLine := na
+        bslLab := na
+if showLiq and not na(tgtSSL)
+    if na(sslLine)
+        sslLine := line.new(barSSL, tgtSSL, bar_index + extendBars, tgtSSL, color=color.new(color.red, 0), style=line.style_dashed, width=1)
+        sslLab  := label.new(bar_index + extendBars, tgtSSL, "SSL", style=label.style_none, textcolor=color.new(color.red,0), size=size.small)
+    else
+        line.set_xy1(sslLine, barSSL, tgtSSL)
+        line.set_xy2(sslLine, bar_index + extendBars, tgtSSL)
+        label.set_xy(sslLab, bar_index + extendBars, tgtSSL)
+else
+    if not na(sslLine)
+        line.delete(sslLine)
+        label.delete(sslLab)
+        sslLine := na
+        sslLab := na
 
 // ---------------------------------------------------------------------------
-// 6) STATUS TABLE
+// 6) SIGNALS  (A+ tap + bias + structure + a liquidity draw to target)
+// ---------------------------------------------------------------------------
+biasBull  = not reqBias or htfTrend == 1
+biasBear  = not reqBias or htfTrend == -1
+structBull= not reqStructure or trend == 1
+structBear= not reqStructure or trend == -1
+liqBull   = not reqLiq or not na(tgtBSL)
+liqBear   = not reqLiq or not na(tgtSSL)
+
+buySignal  = showSignals and tapBull and biasBull and structBull and liqBull
+sellSignal = showSignals and tapBear and biasBear and structBear and liqBear
+
+f_rr(_entry, _stop, _tgt) =>
+    risk = math.abs(_entry - _stop)
+    risk > 0 and not na(_tgt) ? math.abs(_tgt - _entry) / risk : na
+
+if buySignal
+    rrB = f_rr(close, tapBullStop, tgtBSL)
+    label.new(bar_index, low, "BUY" + (na(rrB) ? "" : "  " + str.tostring(rrB, "#.#") + "R"), style=label.style_label_up, color=color.new(color.green,0), textcolor=color.white, size=size.normal)
+    alert("BUY " + syminfo.ticker + " @ " + str.tostring(close) + "  | stop " + str.tostring(tapBullStop) + "  | target(BSL) " + str.tostring(tgtBSL) + (na(rrB) ? "" : "  | " + str.tostring(rrB, "#.#") + "R"), alert.freq_once_per_bar_close)
+if sellSignal
+    rrS = f_rr(close, tapBearStop, tgtSSL)
+    label.new(bar_index, high, "SELL" + (na(rrS) ? "" : "  " + str.tostring(rrS, "#.#") + "R"), style=label.style_label_down, color=color.new(color.red,0), textcolor=color.white, size=size.normal)
+    alert("SELL " + syminfo.ticker + " @ " + str.tostring(close) + "  | stop " + str.tostring(tapBearStop) + "  | target(SSL) " + str.tostring(tgtSSL) + (na(rrS) ? "" : "  | " + str.tostring(rrS, "#.#") + "R"), alert.freq_once_per_bar_close)
+
+alertcondition(buySignal,  "BUY signal",  "BUY {{ticker}} @ {{close}} - A+ POI + bias + structure, target BSL")
+alertcondition(sellSignal, "SELL signal", "SELL {{ticker}} @ {{close}} - A+ POI + bias + structure, target SSL")
+
+// faint POI-tap markers (a tap that did NOT become a full signal)
+plotshape(tapBull and not buySignal,  title="Bull POI tap", style=shape.triangleup,   location=location.belowbar, color=color.new(color.teal,40), size=size.tiny)
+plotshape(tapBear and not sellSignal, title="Bear POI tap", style=shape.triangledown, location=location.abovebar, color=color.new(color.red,40),  size=size.tiny)
+
+// ---------------------------------------------------------------------------
+// 7) STATUS TABLE
 // ---------------------------------------------------------------------------
 if showTable and barstate.islast
-    var table tb = table.new(position.top_right, 2, 3, border_width=1)
+    var table tb = table.new(position.top_right, 2, 5, border_width=1)
     bgD = color.new(color.black, 30)
     table.cell(tb, 0, 0, "HTF bias", text_size=size.small, text_color=color.white, bgcolor=bgD)
     table.cell(tb, 1, 0, htfTrend==1?"Bull":htfTrend==-1?"Bear":"-", text_size=size.small, text_color=color.white, bgcolor=htfTrend==1?bull:htfTrend==-1?bear:color.gray)
-    table.cell(tb, 0, 1, "Live bull POIs", text_size=size.small, text_color=color.white, bgcolor=bgD)
-    table.cell(tb, 1, 1, str.tostring(liveBull), text_size=size.small, text_color=color.white, bgcolor=liveBull>0?color.new(color.teal,40):bgD)
-    table.cell(tb, 0, 2, "Live bear POIs", text_size=size.small, text_color=color.white, bgcolor=bgD)
-    table.cell(tb, 1, 2, str.tostring(liveBear), text_size=size.small, text_color=color.white, bgcolor=liveBear>0?color.new(color.red,40):bgD)
+    table.cell(tb, 0, 1, "Structure", text_size=size.small, text_color=color.white, bgcolor=bgD)
+    table.cell(tb, 1, 1, trend==1?"Bull":trend==-1?"Bear":"-", text_size=size.small, text_color=color.white, bgcolor=trend==1?bull:trend==-1?bear:color.gray)
+    table.cell(tb, 0, 2, "Next BSL", text_size=size.small, text_color=color.white, bgcolor=bgD)
+    table.cell(tb, 1, 2, na(tgtBSL)?"-":str.tostring(tgtBSL), text_size=size.small, text_color=color.white, bgcolor=bgD)
+    table.cell(tb, 0, 3, "Next SSL", text_size=size.small, text_color=color.white, bgcolor=bgD)
+    table.cell(tb, 1, 3, na(tgtSSL)?"-":str.tostring(tgtSSL), text_size=size.small, text_color=color.white, bgcolor=bgD)
+    table.cell(tb, 0, 4, "Live POIs", text_size=size.small, text_color=color.white, bgcolor=bgD)
+    table.cell(tb, 1, 4, str.tostring(liveBull)+"L / "+str.tostring(liveBear)+"S", text_size=size.small, text_color=color.white, bgcolor=bgD)
